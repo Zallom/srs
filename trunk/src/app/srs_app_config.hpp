@@ -658,6 +658,12 @@ public:
     // The kickoff timeout in srs_utime_t for publisher.
     virtual srs_utime_t get_publish_kickoff_for_idle(std::string vhost);
     virtual srs_utime_t get_publish_kickoff_for_idle(SrsConfDirective* vhost);
+    // The takeover policy for a busy publish stream:
+    //   "none"     — reject a new publisher when the stream is busy (legacy).
+    //   "priority" — let a publisher with stream arg role=primary (or no role)
+    //                kick a publisher with role=testpattern. Other combinations
+    //                are rejected.
+    virtual std::string get_publish_takeover_policy(std::string vhost);
 private:
     // Get the global chunk size.
     virtual int get_global_chunk_size();

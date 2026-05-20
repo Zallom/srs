@@ -1902,7 +1902,17 @@ SrsLiveSource::SrsLiveSource()
     
     is_monotonically_increase = false;
     last_packet_time = 0;
-    
+
+    publisher_conn_ = NULL;
+    takeover_pending_ = false;
+    takeover_consumed_ = false;
+    takeover_just_completed_video_ = false;
+    takeover_just_completed_audio_ = false;
+    pts_offset_video_ = 0;
+    pts_offset_audio_ = 0;
+    last_dispatched_video_dts_ = 0;
+    last_dispatched_audio_dts_ = 0;
+
     _srs_config->subscribe(this);
     atc = false;
 }
@@ -2296,6 +2306,20 @@ srs_error_t SrsLiveSource::on_audio_imp(SrsSharedPtrMessage* msg)
 {
     srs_error_t err = srs_success;
 
+    // PTS re-basing after a takeover handoff. On the first packet from the
+    // new publisher, we compute an offset that aligns its timeline with the
+    // last timestamp we dispatched to consumers, plus a 1ms tick so the
+    // result stays strictly monotonic.
+    if (takeover_just_completed_audio_) {
+        pts_offset_audio_ = (last_dispatched_audio_dts_ + 1) - msg->timestamp;
+        takeover_just_completed_audio_ = false;
+        srs_trace("takeover audio re-base: offset=%" PRId64 ", first_pts=%" PRId64,
+                  pts_offset_audio_, msg->timestamp);
+    }
+    if (pts_offset_audio_ != 0) {
+        msg->timestamp += pts_offset_audio_;
+    }
+
     // TODO: FIXME: Support parsing OPUS for RTC.
     if ((err = format_->on_audio(msg)) != srs_success) {
         return srs_error_wrap(err, "format consume audio");
@@ -2337,8 +2361,11 @@ srs_error_t SrsLiveSource::on_audio_imp(SrsSharedPtrMessage* msg)
                 return srs_error_wrap(err, "consume message");
             }
         }
+        // Track the last timestamp we actually pushed to consumers. Used by
+        // the next takeover handoff to compute a re-basing offset.
+        last_dispatched_audio_dts_ = msg->timestamp;
     }
-    
+
     // Refresh the sequence header in metadata.
     if (is_sequence_header || !meta->ash()) {
         if ((err = meta->update_ash(msg)) != srs_success) {
@@ -2409,6 +2436,17 @@ srs_error_t SrsLiveSource::on_video_imp(SrsSharedPtrMessage* msg)
 {
     srs_error_t err = srs_success;
 
+    // PTS re-basing after a takeover handoff. See on_audio_imp for rationale.
+    if (takeover_just_completed_video_) {
+        pts_offset_video_ = (last_dispatched_video_dts_ + 1) - msg->timestamp;
+        takeover_just_completed_video_ = false;
+        srs_trace("takeover video re-base: offset=%" PRId64 ", first_pts=%" PRId64,
+                  pts_offset_video_, msg->timestamp);
+    }
+    if (pts_offset_video_ != 0) {
+        msg->timestamp += pts_offset_video_;
+    }
+
     bool is_sequence_header = SrsFlvVideo::sh(msg->payload, msg->size);
 
     // user can disable the sps parse to workaround when parse sps failed.
@@ -2460,8 +2498,11 @@ srs_error_t SrsLiveSource::on_video_imp(SrsSharedPtrMessage* msg)
                 return srs_error_wrap(err, "consume video");
             }
         }
+        // Track the last timestamp we actually pushed to consumers. Used by
+        // the next takeover handoff to compute a re-basing offset.
+        last_dispatched_video_dts_ = msg->timestamp;
     }
-    
+
     // when sequence header, donot push to gop cache and adjust the timestamp.
     if (is_sequence_header) {
         return err;
@@ -2599,7 +2640,16 @@ srs_error_t SrsLiveSource::on_publish()
     // detect the monotonically again.
     is_monotonically_increase = true;
     last_packet_time = 0;
-    
+
+    // Reset takeover PTS re-basing state. A fresh publish (not a takeover)
+    // must start with zero offset and a clean last-dispatched anchor.
+    takeover_just_completed_video_ = false;
+    takeover_just_completed_audio_ = false;
+    pts_offset_video_ = 0;
+    pts_offset_audio_ = 0;
+    last_dispatched_video_dts_ = 0;
+    last_dispatched_audio_dts_ = 0;
+
     // Notify the hub about the publish event.
     if (hub && (err = hub->on_publish()) != srs_success) {
         return srs_error_wrap(err, "hub publish");
@@ -2632,7 +2682,27 @@ void SrsLiveSource::on_unpublish()
     if (can_publish_) {
         return;
     }
-    
+
+    // Soft handoff: SrsRtmpConn::acquire_publish armed a takeover for an
+    // incoming primary publisher. The leaving publisher must NOT tear down
+    // the pipeline — hub stays active, gop cache and metadata are preserved,
+    // consumers stay attached. The incoming publisher will call
+    // complete_takeover_handoff() to swap source_id.
+    if (takeover_pending_) {
+        srs_trace("takeover handoff: skipping unpublish teardown, hub/gop/meta preserved");
+        // Mark consumed so the incoming publisher's polling loop sees the
+        // release. takeover_pending_ stays true so any racing on_unpublish
+        // (shouldn't happen but defensively) still takes the soft path.
+        // can_publish_ stays false to gate concurrent publish attempts; the
+        // takeover path bypasses the can_publish() check explicitly.
+        takeover_consumed_ = true;
+        return;
+    }
+
+    // Clear publisher tracking on a real unpublish.
+    publisher_conn_ = NULL;
+    publisher_role_.clear();
+
     // Notify the hub about the unpublish event.
     if (hub) {
         hub->on_unpublish();
@@ -2676,6 +2746,82 @@ void SrsLiveSource::on_unpublish()
     // which is actually an http stream that unmounts the HTTP path for streaming, because there maybe some
     // coroutine switch in these handlers.
     can_publish_ = true;
+}
+
+void SrsLiveSource::set_publisher(ISrsExpire* conn, const std::string& role)
+{
+    publisher_conn_ = conn;
+    publisher_role_ = role;
+}
+
+void SrsLiveSource::clear_publisher()
+{
+    publisher_conn_ = NULL;
+    publisher_role_.clear();
+}
+
+ISrsExpire* SrsLiveSource::publisher_conn()
+{
+    return publisher_conn_;
+}
+
+const std::string& SrsLiveSource::publisher_role()
+{
+    return publisher_role_;
+}
+
+void SrsLiveSource::arm_takeover_handoff()
+{
+    takeover_pending_ = true;
+    srs_trace("takeover handoff armed, source_id=%s", _source_id.c_str());
+}
+
+bool SrsLiveSource::takeover_pending()
+{
+    return takeover_pending_;
+}
+
+bool SrsLiveSource::takeover_consumed()
+{
+    return takeover_consumed_;
+}
+
+srs_error_t SrsLiveSource::complete_takeover_handoff(SrsContextId new_cid)
+{
+    srs_error_t err = srs_success;
+
+    if (!takeover_pending_) {
+        srs_warn("takeover handoff: complete called without armed flag, falling through");
+        return err;
+    }
+
+    // The pipeline is still alive (hub, gop, meta, consumers all kept). We just
+    // need consumers to learn about the new source id so logs and stats stay
+    // coherent. Skip the rest of on_publish — no hub restart, no meta clear.
+    if ((err = on_source_id_changed(new_cid)) != srs_success) {
+        return srs_error_wrap(err, "takeover source id change");
+    }
+
+    // Promote the previous publisher's sequence headers to meta->previous_*.
+    // This primes the reduce_sequence_header path so the new publisher's first
+    // vsh/ash is correctly compared: if identical it gets dropped (consumers
+    // were already primed with this exact header), if different it gets
+    // dispatched and consumers update their decoder state.
+    meta->update_previous_vsh();
+    meta->update_previous_ash();
+
+    // Prime PTS re-basing. The next video and audio packet from the new
+    // publisher determine the offset that keeps the dispatched timeline
+    // monotonic for connected consumers.
+    takeover_just_completed_video_ = true;
+    takeover_just_completed_audio_ = true;
+
+    // Clear the flags so a later real unpublish tears down normally.
+    takeover_pending_ = false;
+    takeover_consumed_ = false;
+
+    srs_trace("takeover handoff completed, new source_id=%s", new_cid.c_str());
+    return err;
 }
 
 srs_error_t SrsLiveSource::create_consumer(SrsLiveConsumer*& consumer)

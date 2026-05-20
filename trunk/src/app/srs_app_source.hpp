@@ -482,6 +482,8 @@ public:
 extern SrsLiveSourceManager* _srs_sources;
 
 // The live streaming source.
+class ISrsExpire;
+
 class SrsLiveSource : public ISrsReloadHandler
 {
     friend class SrsOriginHub;
@@ -534,6 +536,35 @@ private:
     srs_utime_t stream_die_at_;
     // The last idle time, while idle means no players.
     srs_utime_t publisher_idle_at_;
+
+    // Publisher tracking for takeover_policy=priority. Set by SrsRtmpConn on
+    // acquire_publish, cleared on release_publish. The role is parsed from the
+    // publish URL's ?role= arg ("primary"/""/"testpattern"). The conn is the
+    // expirable RTMP conn; a higher-priority publisher uses it to kick the
+    // current holder via expire().
+    std::string publisher_role_;
+    ISrsExpire* publisher_conn_;
+
+    // Soft-handoff state for publisher takeover. When armed by an incoming
+    // primary, the leaving publisher's on_unpublish becomes a no-op: hub stays
+    // active, gop cache and metadata are preserved, consumers stay attached.
+    // The incoming publisher then calls complete_takeover_handoff() to swap
+    // source_id without restarting the pipeline.
+    bool takeover_pending_;
+    // Set by the leaving publisher's soft on_unpublish to signal completion.
+    // Polled by the incoming publisher before calling complete_takeover_handoff,
+    // so the handoff only proceeds once the victim has fully released its
+    // publish loop. Cleared by complete_takeover_handoff.
+    bool takeover_consumed_;
+    // After a takeover, the next video/audio packet from the new publisher is
+    // used to compute pts_offset_*. The offset re-bases the new publisher's
+    // PTS so the dispatched timeline remains monotonic for the players.
+    bool takeover_just_completed_video_;
+    bool takeover_just_completed_audio_;
+    int64_t pts_offset_video_;
+    int64_t pts_offset_audio_;
+    int64_t last_dispatched_video_dts_;
+    int64_t last_dispatched_audio_dts_;
 public:
     SrsLiveSource();
     virtual ~SrsLiveSource();
@@ -566,6 +597,26 @@ public:
 public:
     virtual bool can_publish(bool is_edge);
     virtual srs_error_t on_meta_data(SrsCommonMessage* msg, SrsOnMetaDataPacket* metadata);
+
+public:
+    // Publisher tracking for takeover_policy=priority.
+    virtual void set_publisher(ISrsExpire* conn, const std::string& role);
+    virtual void clear_publisher();
+    virtual ISrsExpire* publisher_conn();
+    virtual const std::string& publisher_role();
+
+    // Arm a soft handoff: the next on_unpublish becomes a no-op (keeps hub,
+    // gop cache, consumers and metadata alive). Called by SrsRtmpConn just
+    // before expiring the previous publisher.
+    virtual void arm_takeover_handoff();
+    virtual bool takeover_pending();
+    // Whether the leaving publisher has run its soft on_unpublish (consumed
+    // the handoff). Polled by the incoming publisher before completing.
+    virtual bool takeover_consumed();
+    // Complete the handoff after the previous publisher has released. Updates
+    // the source id and primes PTS re-basing on the next frames. Does not call
+    // hub->on_publish nor reset meta/gop cache.
+    virtual srs_error_t complete_takeover_handoff(SrsContextId new_cid);
 public:
     // TODO: FIXME: Use SrsSharedPtrMessage instead.
     virtual srs_error_t on_audio(SrsCommonMessage* audio);

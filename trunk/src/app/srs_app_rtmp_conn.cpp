@@ -41,6 +41,23 @@ using namespace std;
 #include <srs_app_tencentcloud.hpp>
 #include <srs_app_srt_source.hpp>
 
+// Extract the value of `key` from an RTMP request param string of the form
+// "?k1=v1&k2=v2" (or "k1=v1&k2=v2"). Empty if absent.
+static string srs_request_param_value(const string& param, const string& key)
+{
+    if (param.empty()) return "";
+    string p = (param[0] == '?') ? param.substr(1) : param;
+    vector<string> pairs = srs_string_split(p, "&");
+    for (vector<string>::iterator it = pairs.begin(); it != pairs.end(); ++it) {
+        size_t eq = it->find('=');
+        if (eq == string::npos) continue;
+        if (it->substr(0, eq) == key) {
+            return it->substr(eq + 1);
+        }
+    }
+    return "";
+}
+
 // the timeout in srs_utime_t to wait encoder to republish
 // if timeout, close the connection.
 #define SRS_REPUBLISH_SEND_TIMEOUT (3 * SRS_UTIME_MINUTES)
@@ -1070,12 +1087,49 @@ srs_error_t SrsRtmpConn::do_publishing(SrsSharedPtr<SrsLiveSource> source, SrsPu
 srs_error_t SrsRtmpConn::acquire_publish(SrsSharedPtr<SrsLiveSource> source)
 {
     srs_error_t err = srs_success;
-    
+
     SrsRequest* req = info->req;
+
+    // Parse the publisher role from the publish URL's ?role= arg. Used together
+    // with publish.takeover_policy=priority below to decide whether a primary
+    // publisher can kick a testpattern holder.
+    string role = srs_request_param_value(req->param, "role");
+    bool incoming_is_primary = role.empty() || role == "primary";
+    bool was_takeover = false;
 
     // Check whether RTMP stream is busy.
     if (!source->can_publish(info->edge)) {
-        return srs_error_new(ERROR_SYSTEM_STREAM_BUSY, "rtmp: stream %s is busy", req->get_stream_url().c_str());
+        // Busy. See if takeover policy authorizes a kick.
+        string policy = _srs_config->get_publish_takeover_policy(req->vhost);
+        bool current_is_testpattern = source->publisher_role() == "testpattern";
+        bool can_takeover = (policy == "priority"
+                          && incoming_is_primary
+                          && current_is_testpattern
+                          && source->publisher_conn() != NULL);
+        if (!can_takeover) {
+            return srs_error_new(ERROR_SYSTEM_STREAM_BUSY, "rtmp: stream %s is busy", req->get_stream_url().c_str());
+        }
+
+        // Takeover path: arm the soft handoff so the victim's on_unpublish
+        // becomes a no-op, then expire the victim and poll until it consumes
+        // the handoff (i.e. ran through its soft release).
+        ISrsExpire* victim = source->publisher_conn();
+        srs_trace("takeover: kicking testpattern publisher on stream=%s", req->get_stream_url().c_str());
+        source->arm_takeover_handoff();
+        victim->expire();
+
+        // Deadline is generous enough for a healthy publisher's release path
+        // (interrupt -> recv exit -> release_publish -> on_unpublish).
+        srs_utime_t deadline = srs_get_system_time() + 500 * SRS_UTIME_MILLISECONDS;
+        while (!source->takeover_consumed() && srs_get_system_time() < deadline) {
+            srs_usleep(5 * SRS_UTIME_MILLISECONDS);
+        }
+        if (!source->takeover_consumed()) {
+            return srs_error_new(ERROR_SYSTEM_STREAM_BUSY,
+                                 "rtmp: takeover timed out, stream %s", req->get_stream_url().c_str());
+        }
+
+        was_takeover = true;
     }
 
     // Check whether RTC stream is busy.
@@ -1125,7 +1179,7 @@ srs_error_t SrsRtmpConn::acquire_publish(SrsSharedPtr<SrsLiveSource> source)
         srs_warn("disable RTMP to WebRTC for edge vhost=%s", req->vhost.c_str());
     }
 
-    if (rtc.get() && rtmp_to_rtc) {
+    if (rtc.get() && rtmp_to_rtc && !was_takeover) {
         SrsCompositeBridge* bridge = new SrsCompositeBridge();
         bridge->append(new SrsFrameToRtcBridge(rtc));
 
@@ -1141,8 +1195,20 @@ srs_error_t SrsRtmpConn::acquire_publish(SrsSharedPtr<SrsLiveSource> source)
     // Start publisher now.
     if (info->edge) {
         err = source->on_edge_start_publish();
+    } else if (was_takeover) {
+        // Soft-handoff path: the source pipeline (hub, gop, meta, consumers,
+        // existing bridge) is already alive thanks to arm_takeover_handoff.
+        // Just swap the source_id, prime PTS rebase, and register ourselves
+        // as the new publisher. No on_publish — that would restart everything.
+        err = source->complete_takeover_handoff(_srs_context->get_id());
     } else {
         err = source->on_publish();
+    }
+
+    // Register as the publisher so a later primary may kick us if we're
+    // a testpattern. Done regardless of normal/takeover path.
+    if (err == srs_success) {
+        source->set_publisher(this, role);
     }
 
     return err;
